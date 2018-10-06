@@ -1,12 +1,15 @@
 pragma solidity ^0.4.25;
 pragma experimental "ABIEncoderV2";
 
-contract RootChain {
+import "openzeppelin-solidity/contracts/token/ERC721/ERC721.sol";
+import "openzeppelin-solidity/contracts/token/ERC20/ERC20.sol";
+
+contract PlasmaCash {
+
 
     enum ExitStage {
         NOT_STARTED, // default unitialized
-        STARTED,
-        FINISHED
+        STARTED
     }
 
     struct Transfer {
@@ -30,6 +33,12 @@ contract RootChain {
         IncludedTransfer pc;
         uint256 numChallenges;
         uint256 coinId;
+    }
+
+    struct Coin {
+        address contractAddress;
+        uint256 amount;
+        uint8 mode;
     }
 
     /**
@@ -67,7 +76,7 @@ contract RootChain {
      */
     address public authority;
     bytes32[] public childBlockRoots;
-    uint256[] public coins;
+    Coin[] public coins;
     mapping(uint256 => mapping(address => Exit)) exits;
     mapping(uint256 => mapping(address => mapping(uint256 => IncludedTransfer))) challenges;
     mapping(uint256 => bool) isDeposit;
@@ -91,8 +100,27 @@ contract RootChain {
         payable
         public
     {
-        isDeposit[coins.length] = true;
-        childBlockRoots.push(keccak256(abi.encode(coins.length, Transfer({
+        depositCoin(address(0xe), msg.value, 0);
+    }
+
+    function depositERC20(address erc20addr, uint256 amount)
+        public
+    {
+        ERC20(erc20addr).transferFrom(msg.sender, address(this), amount);
+        depositCoin(erc20addr, amount, 1);
+    }
+
+    function depositERC721(address erc721addr, uint256 uid)
+        public
+    {
+        ERC721(erc721addr).safeTransferFrom(msg.sender, address(this), uid);
+        depositCoin(erc721addr, uid, 2);
+    }
+
+    function depositCoin(address addr, uint256 amount, uint8 mode) private {
+        uint256 coinId = coins.length;
+        isDeposit[coinId] = true;
+        childBlockRoots.push(keccak256(abi.encode(coinId, Transfer({
             oldOwner: msg.sender,
             newOwner: msg.sender,
             oldBlkNum: 0,
@@ -100,8 +128,12 @@ contract RootChain {
             sigR: bytes32(0),
             sigS: bytes32(0)
         }))));
-        coins.push(msg.value);
+        coins.push(
+            Coin(addr, amount, mode)
+        );
+        emit Deposit(coinId, addr, amount, mode, childBlockRoots.length);
     }
+    event Deposit(uint256 indexed coinID, address contractAddress, uint256 amount, uint8 mode, uint256 blockNumber);
 
     function checkInclusion(
         uint256 coinId,
@@ -220,18 +252,36 @@ contract RootChain {
         require(checkInclusion(coinId, css, cssProof));
         IncludedTransfer storage cs = challenges[coinId][exitBeneficiary][csBlkNum];
         require(spends(cs, css, uint256(-1)));
+        // safe sub - avoid underflow
         exits[coinId][exitBeneficiary].numChallenges -= 1;
+        msg.sender.transfer(BOND_AMOUNT);
     }
 
     function finalizeExit(uint256 coinId, address exitBeneficiary) public {
         Exit storage exit = exits[coinId][exitBeneficiary];
+        Coin storage coin = coins[coinId];
 
         require(exit.stage == ExitStage.STARTED);
         require(block.number >= exit.challengeDeadline);
         require(exit.numChallenges == 0);
 
-        exitBeneficiary.transfer(coins[exit.coinId]);
-        exit.stage = ExitStage.FINISHED;
+
+        // Give the coin back
+        if (coin.mode == 0) {
+            exitBeneficiary.transfer(coin.amount);
+        } else if (coin.mode == 1) {
+            ERC20(coin.contractAddress).transfer(msg.sender, coin.amount);
+        } else if (coin.mode == 2) {
+            ERC721(coin.contractAddress).safeTransferFrom(address(this), msg.sender, coin.amount);
+        } else {
+            revert("Invalid coin mode");
+        }
+
+        // Give the bond to the beneficiary
+        exitBeneficiary.transfer(BOND_AMOUNT);
+        delete exits[coinId][exitBeneficiary];
+        delete coins[coinId];
     }
 }
+
 
