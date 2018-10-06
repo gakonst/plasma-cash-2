@@ -6,6 +6,8 @@ import "openzeppelin-solidity/contracts/token/ERC20/ERC20.sol";
 
 contract PlasmaCash {
 
+    uint256 constant BOND_AMOUNT = 0.1 ether;
+    uint256 constant CHALLENGE_WINDOW = 100; // blocks
 
     enum ExitStage {
         NOT_STARTED, // default unitialized
@@ -94,7 +96,9 @@ contract PlasmaCash {
     {
         require(msg.sender == authority);
         childBlockRoots.push(blkRoot);
+        emit SubmittedBlock(childBlockRoots.length, blkRoot);
     }
+    event SubmittedBlock(uint256 blockNumber, bytes32 root);
 
     function deposit()
         payable
@@ -167,7 +171,9 @@ contract PlasmaCash {
         bytes pcProof
     )
         public
+        payable
     {
+        require(msg.value == BOND_AMOUNT);
         require(msg.sender == c.txn.newOwner);
 
         // check inclusion proofs
@@ -188,13 +194,15 @@ contract PlasmaCash {
         require(exits[coinId][msg.sender].stage == ExitStage.NOT_STARTED);
         exits[coinId][msg.sender] = Exit({
             stage: ExitStage.STARTED,
-            challengeDeadline: block.number + 100,
+            challengeDeadline: block.number + CHALLENGE_WINDOW,
             c: c,
             pc: pc,
             numChallenges: 0,
             coinId: coinId
         });
+        emit StartedExit(coinId, pc.blkNum, c.blkNum, msg.sender);
     }
+    event StartedExit(uint256 coinId, uint256 pBlockNumber, uint256 blockNumber, address exitBeneficiary);
 
     function spends(
         IncludedTransfer a,
@@ -220,25 +228,29 @@ contract PlasmaCash {
 
         IncludedTransfer cs,
         bytes csProof
-    ) public {
-        require(exits[coinId][exitBeneficiary].stage == ExitStage.STARTED);
+    ) public payable {
+        Exit storage exit = exits[coinId][exitBeneficiary];
+        require(exit.stage == ExitStage.STARTED);
         require(checkInclusion(coinId, cs, csProof));
 
         if ( /* Type 1: C has been spent */
-            spends(exits[coinId][exitBeneficiary].c, cs, uint256(-1))
+            spends(exit.c, cs, uint256(-1)) || spends(exit.pc, cs, exit.c.blkNum)
         ) {
-            exits[coinId][exitBeneficiary].stage = ExitStage.FINISHED;
-        } else if ( /* Type 2: P(C) has been spent before C */
-            spends(exits[coinId][exitBeneficiary].pc, cs, exits[coinId][exitBeneficiary].c.blkNum)
-        ) {
-            exits[coinId][exitBeneficiary].stage = ExitStage.FINISHED;
+           delete exits[coinId][exitBeneficiary];
+           msg.sender.transfer(BOND_AMOUNT);
         } else if ( /* Type 3: Challenger provides a tx in history. Exitor needs to respond it. */
-            cs.blkNum < exits[coinId][exitBeneficiary].pc.blkNum
+            cs.blkNum < exit.pc.blkNum
         ) {
+            require(msg.value == BOND_AMOUNT);
+            require(block.number < exit.challengeDeadline - 50);
             challenges[coinId][exitBeneficiary][cs.blkNum] = cs;
             exits[coinId][exitBeneficiary].numChallenges += 1;
+            emit ChallengedExit(coinId, exitBeneficiary, cs.blkNum, msg.sender);
+        } else {
+            revert("Invalid challenge type");
         }
     }
+    event ChallengedExit(uint256 coinId, address exitBeneficiary, uint256 challengingBlkNum, address challenger);
 
     function respondChallengeExit(
         uint256 coinId,
